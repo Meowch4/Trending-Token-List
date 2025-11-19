@@ -8,10 +8,9 @@ import type { TrendingToken } from "@/types/trendings";
 const WS_URL = "wss://web-t.pinkpunk.io/ws";
 
 /**
- * version 2:
- * - version 1 features
- * - add gzip decompressData
- * - handle compressed string / ArrayBuffer / Blob
+ * version 3:
+ * - version 2 features
+ * - add ping → pong heartbeat reply
  */
 export function useTrendingTokens(opts?: { mock?: boolean }) {
   const mock = opts?.mock ?? false;
@@ -21,7 +20,7 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  /** 解压函数：ISO-8859-1 → gzip → UTF-8 */
+  /** gzip 解压 */
   const decompressData = useCallback((s: string) => {
     const bytes = new Uint8Array(s.length);
     for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xff;
@@ -29,60 +28,87 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
     return new TextDecoder("utf-8").decode(out);
   }, []);
 
-  /** 处理 JSON 对象 */
-  const handleJson = useCallback((json: any) => {
-    if (!json) return;
+  /** ping → pong */
+  const sendPong = useCallback((ts: string | number) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
-    // 初始快照
-    if (json.msg === "success" && Array.isArray(json.data)) {
-      const newMap: Record<string, TrendingToken> = {};
-      for (const item of json.data) {
-        const id =
-          item.pair ??
-          item.baseToken ??
-          item.baseSymbol ??
-          String(Math.random());
-        newMap[id] = item;
+    try {
+      wsRef.current.send(
+        JSON.stringify({
+          topic: "pong",
+          event: "sub",
+          pong: String(ts),
+          interval: "",
+          pair: "",
+          chainId: "",
+          compression: 1,
+        })
+      );
+    } catch {}
+  }, []);
+
+  /** 处理 JSON 数据 */
+  const handleJson = useCallback(
+    (json: any) => {
+      if (!json) return;
+
+      // 心跳检测 ping
+      if (json.topic === "ping" || json.ping) {
+        const ts = json.ping ?? json.t ?? Date.now();
+        sendPong(ts);
+        return;
       }
-      setMap(newMap);
-      return;
-    }
 
-    // 增量数据
-    if (json.topic === "trending" && Array.isArray(json.data)) {
-      setMap((prev) => {
-        const copy = { ...prev };
+      // 初始快照
+      if (json.msg === "success" && Array.isArray(json.data)) {
+        const newMap: Record<string, TrendingToken> = {};
         for (const item of json.data) {
           const id =
             item.pair ??
             item.baseToken ??
             item.baseSymbol ??
             String(Math.random());
-          copy[id] = { ...(copy[id] ?? {}), ...item };
+          newMap[id] = item;
         }
-        return copy;
-      });
-    }
-  }, []);
+        setMap(newMap);
+        return;
+      }
 
-  /** 处理原始 WS 数据：尝试 JSON → gzip 解压 */
+      // 增量更新
+      if (json.topic === "trending" && Array.isArray(json.data)) {
+        setMap((prev) => {
+          const copy = { ...prev };
+          for (const item of json.data) {
+            const id =
+              item.pair ??
+              item.baseToken ??
+              item.baseSymbol ??
+              String(Math.random());
+            copy[id] = { ...(copy[id] ?? {}), ...item };
+          }
+          return copy;
+        });
+      }
+    },
+    [sendPong]
+  );
+
+  /** 处理原始 WS 数据 */
   const handleRaw = useCallback(
     (raw: any) => {
-      // Plain JSON
+      // plain JSON
       if (typeof raw === "string" && raw.trim().startsWith("{")) {
         try {
-          const j = JSON.parse(raw);
-          handleJson(j);
+          handleJson(JSON.parse(raw));
           return;
         } catch {}
       }
 
-      // ISO-8859-1 gzip string
+      // gzip string
       if (typeof raw === "string") {
         try {
           const txt = decompressData(raw);
-          const j = JSON.parse(txt);
-          handleJson(j);
+          handleJson(JSON.parse(txt));
           return;
         } catch {}
       }
@@ -90,13 +116,11 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       // ArrayBuffer
       if (raw instanceof ArrayBuffer) {
         try {
-          const bytes = new Uint8Array(raw);
+          const arr = new Uint8Array(raw);
           let s = "";
-          for (let i = 0; i < bytes.length; i++)
-            s += String.fromCharCode(bytes[i]);
+          for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
           const txt = decompressData(s);
-          const j = JSON.parse(txt);
-          handleJson(j);
+          handleJson(JSON.parse(txt));
           return;
         } catch {}
       }
@@ -105,13 +129,13 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       if (raw instanceof Blob) {
         const reader = new FileReader();
         reader.onload = () => {
-          const text = String(reader.result ?? "");
+          const txt = String(reader.result ?? "");
           try {
-            if (text.trim().startsWith("{")) {
-              handleJson(JSON.parse(text));
-            } else {
-              const txt = decompressData(text);
+            if (txt.trim().startsWith("{")) {
               handleJson(JSON.parse(txt));
+            } else {
+              const unzipped = decompressData(txt);
+              handleJson(JSON.parse(unzipped));
             }
           } catch {}
         };
@@ -121,7 +145,7 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
     [decompressData, handleJson]
   );
 
-  /** 建立 WebSocket 连接 */
+  /** 连接 */
   const connect = useCallback(() => {
     if (mock) {
       setConnected(true);
@@ -152,7 +176,6 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       };
 
       ws.onmessage = (ev) => handleRaw(ev.data);
-
       ws.onerror = () => setError("WebSocket error");
       ws.onclose = () => setConnected(false);
     } catch {
