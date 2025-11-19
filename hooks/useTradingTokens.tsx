@@ -2,19 +2,16 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import pako from "pako";
 import type { TrendingToken } from "@/types/trendings";
 
 const WS_URL = "wss://web-t.pinkpunk.io/ws";
 
 /**
- * version 1:
- * - connect to WS
- * - subscribe trending
- * - handle plain JSON messages
- * - no gzip decode
- * - no heartbeat
- * - no reconnect
- * - no batching
+ * version 2:
+ * - version 1 features
+ * - add gzip decompressData
+ * - handle compressed string / ArrayBuffer / Blob
  */
 export function useTrendingTokens(opts?: { mock?: boolean }) {
   const mock = opts?.mock ?? false;
@@ -24,27 +21,19 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const subscribeTrending = useCallback(() => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    try {
-      wsRef.current.send(
-        JSON.stringify({
-          topic: "trending",
-          event: "sub",
-          interval: "",
-          pair: "",
-          chainId: "56",
-          compression: 0,
-        })
-      );
-    } catch {}
+  /** 解压函数：ISO-8859-1 → gzip → UTF-8 */
+  const decompressData = useCallback((s: string) => {
+    const bytes = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xff;
+    const out = pako.inflate(bytes);
+    return new TextDecoder("utf-8").decode(out);
   }, []);
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  /** 处理 JSON 对象 */
   const handleJson = useCallback((json: any) => {
     if (!json) return;
 
-    // initial snapshot
+    // 初始快照
     if (json.msg === "success" && Array.isArray(json.data)) {
       const newMap: Record<string, TrendingToken> = {};
       for (const item of json.data) {
@@ -59,7 +48,7 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       return;
     }
 
-    // incremental updates
+    // 增量数据
     if (json.topic === "trending" && Array.isArray(json.data)) {
       setMap((prev) => {
         const copy = { ...prev };
@@ -76,24 +65,70 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
     }
   }, []);
 
+  /** 处理原始 WS 数据：尝试 JSON → gzip 解压 */
+  const handleRaw = useCallback(
+    (raw: any) => {
+      // Plain JSON
+      if (typeof raw === "string" && raw.trim().startsWith("{")) {
+        try {
+          const j = JSON.parse(raw);
+          handleJson(j);
+          return;
+        } catch {}
+      }
+
+      // ISO-8859-1 gzip string
+      if (typeof raw === "string") {
+        try {
+          const txt = decompressData(raw);
+          const j = JSON.parse(txt);
+          handleJson(j);
+          return;
+        } catch {}
+      }
+
+      // ArrayBuffer
+      if (raw instanceof ArrayBuffer) {
+        try {
+          const bytes = new Uint8Array(raw);
+          let s = "";
+          for (let i = 0; i < bytes.length; i++)
+            s += String.fromCharCode(bytes[i]);
+          const txt = decompressData(s);
+          const j = JSON.parse(txt);
+          handleJson(j);
+          return;
+        } catch {}
+      }
+
+      // Blob
+      if (raw instanceof Blob) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const text = String(reader.result ?? "");
+          try {
+            if (text.trim().startsWith("{")) {
+              handleJson(JSON.parse(text));
+            } else {
+              const txt = decompressData(text);
+              handleJson(JSON.parse(txt));
+            }
+          } catch {}
+        };
+        reader.readAsText(raw);
+      }
+    },
+    [decompressData, handleJson]
+  );
+
+  /** 建立 WebSocket 连接 */
   const connect = useCallback(() => {
     if (mock) {
-      // simple mock mode
       setConnected(true);
       setError(null);
       const seed = {
-        btc: {
-          pair: "btc",
-          baseSymbol: "BTC",
-          priceUsd: 60000,
-          priceChange24h: 0.012,
-        },
-        eth: {
-          pair: "eth",
-          baseSymbol: "ETH",
-          priceUsd: 3500,
-          priceChange24h: -0.003,
-        },
+        btc: { pair: "btc", baseSymbol: "BTC", priceUsd: 60000 },
+        eth: { pair: "eth", baseSymbol: "ETH", priceUsd: 3500 },
       } as Record<string, TrendingToken>;
       setMap(seed);
       return;
@@ -106,32 +141,24 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       ws.onopen = () => {
         setConnected(true);
         setError(null);
-        subscribeTrending();
+        ws.send(
+          JSON.stringify({
+            topic: "trending",
+            event: "sub",
+            chainId: "56",
+            compression: 0,
+          })
+        );
       };
 
-      ws.onmessage = (ev) => {
-        if (typeof ev.data === "string") {
-          try {
-            const json = JSON.parse(ev.data);
-            handleJson(json);
-          } catch {
-            // ignore
-          }
-        }
-      };
+      ws.onmessage = (ev) => handleRaw(ev.data);
 
-      ws.onerror = () => {
-        setError("WebSocket error");
-      };
-
-      ws.onclose = () => {
-        setConnected(false);
-      };
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    } catch (e) {
+      ws.onerror = () => setError("WebSocket error");
+      ws.onclose = () => setConnected(false);
+    } catch {
       setError("Failed to create WebSocket");
     }
-  }, [mock, subscribeTrending, handleJson]);
+  }, [mock, handleRaw]);
 
   useEffect(() => {
     connect();
