@@ -1,4 +1,3 @@
-// src/hooks/useTrendingTokens.ts
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -8,9 +7,7 @@ import type { TrendingToken } from "@/types/trendings";
 const WS_URL = "wss://web-t.pinkpunk.io/ws";
 
 /**
- * version 3:
- * - version 2 features
- * - add ping → pong heartbeat reply
+ * version: add reconnect/backoff + auto-reconnect
  */
 export function useTrendingTokens(opts?: { mock?: boolean }) {
   const mock = opts?.mock ?? false;
@@ -19,6 +16,26 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
   const [map, setMap] = useState<Record<string, TrendingToken>>({});
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const reconnectTimer = useRef<NodeJS.Timeout | null>(null);
+  const reconnectAttempts = useRef(0);
+
+  const scheduleReconnect = useCallback(() => {
+    if (mock) return;
+
+    if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+
+    const base = 1500;
+    const delay = Math.min(
+      base * Math.pow(2, reconnectAttempts.current),
+      30000
+    );
+
+    reconnectTimer.current = setTimeout(() => {
+      reconnectAttempts.current++;
+      connect();
+    }, delay);
+  }, [mock]);
 
   /** gzip 解压 */
   const decompressData = useCallback((s: string) => {
@@ -52,7 +69,7 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
     (json: any) => {
       if (!json) return;
 
-      // 心跳检测 ping
+      // 心跳 ping
       if (json.topic === "ping" || json.ping) {
         const ts = json.ping ?? json.t ?? Date.now();
         sendPong(ts);
@@ -118,7 +135,8 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
         try {
           const arr = new Uint8Array(raw);
           let s = "";
-          for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+          for (let i = 0; i < arr.length; i++)
+            s += String.fromCharCode(arr[i]);
           const txt = decompressData(s);
           handleJson(JSON.parse(txt));
           return;
@@ -150,6 +168,7 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
     if (mock) {
       setConnected(true);
       setError(null);
+      reconnectAttempts.current = 0;
       const seed = {
         btc: { pair: "btc", baseSymbol: "BTC", priceUsd: 60000 },
         eth: { pair: "eth", baseSymbol: "ETH", priceUsd: 3500 },
@@ -165,6 +184,8 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       ws.onopen = () => {
         setConnected(true);
         setError(null);
+        reconnectAttempts.current = 0;
+
         ws.send(
           JSON.stringify({
             topic: "trending",
@@ -177,11 +198,15 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
 
       ws.onmessage = (ev) => handleRaw(ev.data);
       ws.onerror = () => setError("WebSocket error");
-      ws.onclose = () => setConnected(false);
+
+      ws.onclose = () => {
+        setConnected(false);
+        scheduleReconnect();
+      };
     } catch {
       setError("Failed to create WebSocket");
     }
-  }, [mock, handleRaw]);
+  }, [mock, handleRaw, scheduleReconnect]);
 
   useEffect(() => {
     connect();
@@ -190,8 +215,7 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
         wsRef.current?.close();
       } catch {}
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [connect]);
 
   const tokens = Object.values(map);
 
