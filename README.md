@@ -50,31 +50,13 @@
 
 ---
 
-## 🧱 项目结构
-
-src/
-├── app/
-│ └── page.tsx
-├── components/
-│ ├── TokenList.tsx
-│ └── TokenRow.tsx
-├── hooks/
-│ └── useTrendingTokens.ts
-├── styles/
-│ └── globals.css
-└── types/
-└── trending.ts
-
-
----
-
 ## 🚀 如何本地运行
 
 1. 克隆仓库  
    ```bash
    git clone https://github.com/Meowch4/Trending-Token-List.git
    cd Trending-Token-List
-  ```
+    ```
 2. 安装依赖
   ```bash
   npm install
