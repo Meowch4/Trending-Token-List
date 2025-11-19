@@ -6,17 +6,17 @@ import type { TrendingToken } from "@/types/trendings";
 
 const WS_URL = "wss://web-t.pinkpunk.io/ws";
 
-/**
- * version: add reconnect/backoff + auto-reconnect
- */
 export function useTrendingTokens(opts?: { mock?: boolean }) {
   const mock = opts?.mock ?? false;
+
   const wsRef = useRef<WebSocket | null>(null);
 
+  // 最终渲染状态
   const [map, setMap] = useState<Record<string, TrendingToken>>({});
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // ====== 自动重连（指数退避） ======
   const reconnectTimer = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttempts = useRef(0);
 
@@ -35,7 +35,49 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       reconnectAttempts.current++;
       connect();
     }, delay);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mock]);
+
+  // ====== 批处理 pending map / flush ======
+  const pendingRef = useRef<Record<string, TrendingToken>>({});
+  const flushTimer = useRef<NodeJS.Timeout | null>(null);
+
+  const flush = useCallback(() => {
+    const pending = pendingRef.current;
+    pendingRef.current = {};
+
+    if (Object.keys(pending).length === 0) return;
+
+    setMap((prev) => {
+      const next = { ...prev };
+      for (const id in pending) {
+        next[id] = pending[id];
+      }
+      return next;
+    });
+  }, []);
+
+  const queueUpdate = useCallback(
+    (items: TrendingToken[]) => {
+      for (const item of items) {
+        const id =
+          item.pair ??
+          item.baseToken ??
+          item.baseSymbol ??
+          String(Math.random());
+
+        pendingRef.current[id] = {
+          ...pendingRef.current[id],
+          ...item,
+        };
+      }
+
+      if (flushTimer.current) clearTimeout(flushTimer.current);
+
+      flushTimer.current = setTimeout(flush, 80);
+    },
+    [flush]
+  );
 
   /** gzip 解压 */
   const decompressData = useCallback((s: string) => {
@@ -63,13 +105,13 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       );
     } catch {}
   }, []);
-
   /** 处理 JSON 数据 */
   const handleJson = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (json: any) => {
       if (!json) return;
 
-      // 心跳 ping
+      // ping
       if (json.topic === "ping" || json.ping) {
         const ts = json.ping ?? json.t ?? Date.now();
         sendPong(ts);
@@ -91,29 +133,18 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
         return;
       }
 
-      // 增量更新
+      // 增量更新（批处理）
       if (json.topic === "trending" && Array.isArray(json.data)) {
-        setMap((prev) => {
-          const copy = { ...prev };
-          for (const item of json.data) {
-            const id =
-              item.pair ??
-              item.baseToken ??
-              item.baseSymbol ??
-              String(Math.random());
-            copy[id] = { ...(copy[id] ?? {}), ...item };
-          }
-          return copy;
-        });
+        queueUpdate(json.data);
       }
     },
-    [sendPong]
+    [sendPong, queueUpdate]
   );
 
   /** 处理原始 WS 数据 */
   const handleRaw = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (raw: any) => {
-      // plain JSON
       if (typeof raw === "string" && raw.trim().startsWith("{")) {
         try {
           handleJson(JSON.parse(raw));
@@ -121,7 +152,6 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
         } catch {}
       }
 
-      // gzip string
       if (typeof raw === "string") {
         try {
           const txt = decompressData(raw);
@@ -130,7 +160,6 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
         } catch {}
       }
 
-      // ArrayBuffer
       if (raw instanceof ArrayBuffer) {
         try {
           const arr = new Uint8Array(raw);
@@ -143,7 +172,6 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
         } catch {}
       }
 
-      // Blob
       if (raw instanceof Blob) {
         const reader = new FileReader();
         reader.onload = () => {
@@ -169,10 +197,12 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       setConnected(true);
       setError(null);
       reconnectAttempts.current = 0;
+
       const seed = {
         btc: { pair: "btc", baseSymbol: "BTC", priceUsd: 60000 },
         eth: { pair: "eth", baseSymbol: "ETH", priceUsd: 3500 },
       } as Record<string, TrendingToken>;
+
       setMap(seed);
       return;
     }
@@ -197,7 +227,10 @@ export function useTrendingTokens(opts?: { mock?: boolean }) {
       };
 
       ws.onmessage = (ev) => handleRaw(ev.data);
-      ws.onerror = () => setError("WebSocket error");
+
+      ws.onerror = () => {
+        setError("WebSocket error");
+      };
 
       ws.onclose = () => {
         setConnected(false);
